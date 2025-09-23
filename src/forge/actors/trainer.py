@@ -17,6 +17,15 @@ import torch
 import torch.distributed.checkpoint as dcp
 import torchstore as ts
 
+from forge.actors.torchstore_utils import (
+    extract_param_name,
+    get_param_key,
+    get_param_prefix,
+)
+
+from forge.controller import ForgeActor
+from forge.data.utils import batch_to_device
+
 from monarch.actor import current_rank, current_size, endpoint
 from torch import Tensor
 from torch.distributed.checkpoint._nested_dict import flatten_state_dict
@@ -35,9 +44,6 @@ from torchtitan.config.job_config import (
 )
 from torchtitan.experiments.forge.engine import ForgeEngine
 from torchtitan.experiments.forge.job_config import ForgeJobConfig
-
-from forge.controller import ForgeActor
-from forge.data.utils import batch_to_device
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -289,6 +295,23 @@ class RLTrainer(ForgeActor):
         end_time = time.time()
 
         logger.debug(f"Pushed weights to {key} in {end_time - start_time:.2f} seconds")
+
+    @endpoint
+    async def push_weights_hf_nonsharded(self, policy_version: int) -> None:
+        """Push weights to torchstore in HF format, non-sharded."""
+        if "model" not in self.engine.checkpointer.states:
+            raise RuntimeError("Model state not found in checkpointer state")
+
+        sd = self.engine.checkpointer.states["model"].state_dict()
+        flattened_state_dict, _ = flatten_state_dict(sd)
+        if self.engine.checkpointer.sd_adapter is None:
+            raise RuntimeError(
+                "Trying to save checkpoint in HF safetensors format, but sd_adapter is not provided."
+            )
+        hf_state_dict = self.engine.checkpointer.sd_adapter.to_hf(flattened_state_dict)
+        for name, param in hf_state_dict.items():
+            key = get_param_key(policy_version, name)
+            await ts.put(key, param)
 
     @endpoint
     async def cleanup(self) -> None:
