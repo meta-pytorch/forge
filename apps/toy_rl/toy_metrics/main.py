@@ -18,6 +18,7 @@ from forge.observability.perf_tracker import trace, Tracer
 from monarch.actor import current_rank, endpoint
 
 logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("forge.observability.metrics").setLevel(logging.DEBUG)
 
 
 class TrainActor(ForgeActor):
@@ -82,31 +83,33 @@ async def main():
     group = f"grpo_exp_{int(time.time())}"
 
     # Config format: {backend_name: backend_config_dict}
-    # Each backend can specify reduce_across_ranks to control distributed logging behavior
     config = {
-        "console": {"reduce_across_ranks": True},
+        "console": {"logging_mode": "per_rank_reduce"},
         "wandb": {
-            "project": "my_project",
+            "project": "immediate_logging_test",
             "group": group,
-            "reduce_across_ranks": False,
-            # Only useful if NOT reduce_across_ranks.
-            "share_run_id": False,  # Share run ID across ranks -- Not recommended.
+            "logging_mode": "per_rank_no_reduce",
+            "per_rank_share_run": False,
         },
     }
 
     service_config = {"procs": 2, "num_replicas": 2, "with_gpus": False}
-    mlogger = await get_or_create_metric_logger()
-    await mlogger.init_backends.call_one(config)
+    mlogger = await get_or_create_metric_logger(actor_name="Controller")
 
     # Spawn services first (triggers registrations via provisioner hook)
     trainer = await TrainActor.options(**service_config).as_service()
     generator = await GeneratorActor.options(**service_config).as_service()
 
+    # Initialize after spawning services
+    await mlogger.init_backends.call_one(config)
+
     for i in range(3):
         print(f"\n=== Global Step {i} ===")
+        record_metric("main/global_step", 1, Reduce.MEAN)
         await trainer.train_step.fanout(i)
         for sub in range(3):
             await generator.generate_step.fanout(i, sub)
+            await asyncio.sleep(0.1)
         await mlogger.flush.call_one(i)
 
     # shutdown
