@@ -27,6 +27,7 @@ from .metrics import (
     Reduce,
     reduce_metrics_states,
     RewardThresholdFilter,
+    SampleAccumulator,
     StdAccumulator,
     SumAccumulator,
     TopBottomKFilter,
@@ -62,6 +63,8 @@ __all__ = [
     "MaxAccumulator",
     "MinAccumulator",
     "StdAccumulator",
+    "SampleAccumulator",
+    # Filter classes
     "TopBottomKFilter",
     "RewardThresholdFilter",
     "RandomRatioFilter",
