@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import heapq
 import logging
 
 import os
+import random
 from abc import ABC, abstractmethod
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -22,6 +24,7 @@ class Reduce(Enum):
     MAX = "max"
     MIN = "min"
     STD = "std"
+    SAMPLE = "sample"
 
     @property
     def accumulator_class(self):
@@ -31,6 +34,7 @@ class Reduce(Enum):
             Reduce.MAX: MaxAccumulator,
             Reduce.MIN: MinAccumulator,
             Reduce.STD: StdAccumulator,
+            Reduce.SAMPLE: SampleAccumulator,
         }
         return mapping[self]
 
@@ -161,6 +165,110 @@ def reduce_metrics_states(states: List[Dict[str, Dict[str, Any]]]) -> Dict[str, 
         reduced_metrics[key] = reduced_value
 
     return reduced_metrics
+
+
+#################
+# SampleFilters #
+#################
+
+
+class SampleFilter(ABC):
+    """Abstract base class for sample filtering."""
+
+    @abstractmethod
+    def filter_append(self, sample: Dict) -> bool:
+        """
+        Decide whether a sample should be kept at append time.
+        Return True if the sample should be stored, False otherwise.
+        """
+        pass
+
+    def filter_flush(self, samples: List[Dict]) -> List[Dict]:
+        """
+        Optionally filter or transform the collected samples at flush time.
+        Default: return the samples unchanged.
+        """
+        return samples
+
+    def reset(self) -> None:
+        """Clears for next accumulation cycle."""
+        pass
+
+
+class RandomRatioFilter:
+    """Randomly keep a fraction of samples."""
+
+    def __init__(self, ratio=0.05):
+        self.ratio = ratio
+
+    def filter_append(self, sample):
+        return random.random() < self.ratio
+
+
+class RewardThresholdFilter:
+    """
+    Keep samples only if their reward is < lt or > gt (depending on which bound is set).
+    If a bound is None, that side of the filter is disabled.
+    """
+
+    def __init__(self, lt=None, gt=None):
+        self.lt = lt
+        self.gt = gt
+
+    def filter_append(self, sample):
+        r = sample.get("reward", 0.0)
+
+        # If lt is set: drop samples with reward >= lt
+        if self.lt is not None and r >= self.lt:
+            return False
+
+        # If gt is set: drop samples with reward <= gt
+        if self.gt is not None and r <= self.gt:
+            return False
+
+        # Otherwise, keep this sample
+        return True
+
+
+class TopBottomKFilter(SampleFilter):
+    """Keep the top-k and bottom-k samples by a given key (e.g., reward)."""
+
+    def __init__(self, top_k=1, bottom_k=1, key="reward"):
+        self.top_k = top_k
+        self.bottom_k = bottom_k
+        self.key = key
+        self._top_heap = []  # min-heap for top-k
+        self._bottom_heap = []  # max-heap for bottom-k (store -value)
+
+    def filter_append(self, sample: Dict) -> bool:
+        val = sample.get(self.key, 0.0)
+
+        # If top_k or bottom_k <= 0, it means "disable" that side of filtering (i.e., keep none).
+        # maintain top-k
+        if self.top_k > 0:
+            if len(self._top_heap) < self.top_k:
+                heapq.heappush(self._top_heap, (val, sample))
+            else:
+                heapq.heappushpop(self._top_heap, (val, sample))
+
+        # maintain bottom-k
+        if self.bottom_k > 0:
+            if len(self._bottom_heap) < self.bottom_k:
+                heapq.heappush(self._bottom_heap, (-val, sample))
+            else:
+                heapq.heappushpop(self._bottom_heap, (-val, sample))
+
+        # always return False here because we don't store in samples list
+        return False
+
+    def filter_flush(self, samples: List[Dict]) -> List[Dict]:
+        tops = [s for _, s in self._top_heap]
+        bottoms = [s for _, s in self._bottom_heap]
+        return bottoms + tops
+
+    def reset(self):
+        self._top_heap = []
+        self._bottom_heap = []
 
 
 ################
@@ -349,6 +457,56 @@ class StdAccumulator(MetricAccumulator):
         self.sum = 0.0
         self.sum_sq = 0.0
         self.count = 0
+
+
+class SampleAccumulator(MetricAccumulator):
+    """Accumulator for sample-level metrics (e.g., prompt/response/reward dicts).
+
+    Optionally uses a SampleFilter to decide what to keep at append/flush time.
+    """
+
+    def __init__(self, reduction: Reduce, filter: SampleFilter | None = None):
+        super().__init__(reduction)
+        self.samples: List[Dict[str, Any]] = []
+        self.filter = filter
+
+    def append(self, value: dict) -> None:
+        assert isinstance(value, dict)
+
+        # If filter is provided, only keep the sample if filter_append returns True
+        if self.filter:
+            if self.filter.filter_append(value):
+                self.samples.append(value)
+        else:
+            self.samples.append(value)
+
+    def get_value(self) -> list[dict]:
+        """Return locally collected (and optionally filtered) samples."""
+        if self.filter:
+            # Apply flush-time filter (e.g. heap selection, threshold trimming)
+            return self.filter.filter_flush(self.samples)
+        return self.samples
+
+    def get_state(self) -> Dict[str, Any]:
+        """Serialize accumulator state for cross-rank reduction."""
+        return {
+            "reduction_type": self.reduction_type.value,
+            "samples": self.get_value(),
+        }
+
+    @classmethod
+    def get_reduced_value_from_states(cls, states: List[Dict[str, Any]]) -> list[dict]:
+        """Merge sample states across ranks."""
+        merged = []
+        for s in states:
+            merged.extend(s.get("samples", []))
+        return merged
+
+    def reset(self) -> None:
+        """Clear local samples and reset filter state."""
+        self.samples.clear()
+        if self.filter:
+            self.filter.reset()
 
 
 #############
